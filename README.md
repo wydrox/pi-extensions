@@ -25,7 +25,7 @@ These are original work, not based on pi's example templates.
 | `figma/` | Fetches structured design context from Figma files/frames/nodes via the Figma API. Summarizes the design tree and optionally attaches rendered preview images for frontend implementation work. |
 | `input-spellcheck/` | Real-time spellchecking for user input in the TUI. Uses `node-spellchecker` (or a fallback typo map), marks misspellings, and suggests corrections. Disable with `spellcheck:off`. |
 | `martmart-mcp/` | MCP (Model Context Protocol) bridge for the MartMart shopping CLI. Spawns `martmart` as an MCP server and exposes its tools (search, cart, checkout, orders) to pi. |
-| `magneto.ts` | Standalone long-running execution supervisor/control plane. Maintains a cross-domain contract as the source of truth, monitors todo/tooluse/subagents/context pressure, scores goal progress/contract fit/quality evidence, recommends skills/extensions, tracks interventions, and supports compact/handoff continuity. |
+| `magneto.ts` | Standalone long-running execution supervisor/control plane. Maintains a cross-domain contract as the source of truth, derives a priority ready-queue from todo, monitors tooluse/subagents/context pressure, scores goal progress/contract fit/quality evidence, recommends skills/extensions, tracks interventions, and supports compact/handoff continuity. |
 | `mempalace/` | Full MemPalace integration. Read/write tools: search, list wings/rooms/drawers, add/update/delete drawers, knowledge-graph add/invalidate/query, mine files into the palace, and wake-up context starters. |
 | `monit/` | Lightweight file/process monitor (`/monit`). Watches files or runs commands on intervals, logs output to `.pi/monit/`, and can open results in a TUI overlay. Supports `fix` and `backlog` modes. |
 | `observability.ts` | Polls platform logs and CDP, deduplicates incidents, and upserts sidebar TODOs. Provides a live observability overlay showing system health and alerts. |
@@ -37,7 +37,7 @@ These are original work, not based on pi's example templates.
 
 ### Magneto commands
 
-Magneto is a supervisor/control-plane for very long sessions. It coordinates strategy above todo, keeps the cross-domain contract as the source of truth, monitors execution quality, and tries to keep independent work parallelized up to the default capacity of **8 subagents**.
+Magneto is a supervisor/control-plane for very long sessions. It coordinates strategy above todo, keeps the cross-domain contract as the source of truth, builds a priority ready-queue from todo hierarchy, monitors execution quality, and tries to keep independent work parallelized up to the default capacity of **8 subagents**.
 
 Daily interface should stay small: usually start with `/magneto start`, check `/magneto status` or `/magneto audit`, and use `/magneto handoff` when the session gets too large. The other commands are operational knobs for unusual cases.
 
@@ -48,7 +48,7 @@ Daily interface should stay small: usually start with `/magneto start`, check `/
 | `/magneto audit` | A drift detector. It forces Magneto to compare execution against the contract and surface gaps like missing outcomes, low evidence coverage, repeated tool failures, blocked todos, or unused parallel capacity. |
 | `/magneto supervise on\|off` | Lets you switch between passive state tracking and active steering. Use `on` when the model needs guardrails; use `off` when you want Magneto to remember state but not influence prompts. |
 | `/magneto mode observe\|supervise\|strict` | Controls how hard Magneto governs. `observe` watches only, `supervise` nudges the worker with contract/policy guidance, `strict` is intended for higher-friction enforcement when mistakes are expensive. |
-| `/magneto capacity <N>` | Overrides the default **8** subagent target. Magneto uses this to detect under-parallelized execution and nudge the worker to split independent work instead of grinding serially. |
+| `/magneto capacity <N>` | Overrides the default **8** subagent target. Magneto uses this to keep the ready queue dispatching into free subagent slots and to flag serial grinding when independent work is available. |
 | `/magneto auto-compact on\|off` | Protects very long sessions from context rot. When enabled, Magneto requests compact before context pressure makes the model forget the contract or repeat stale reasoning. |
 | `/magneto threshold <compactTokens> [handoffTokens]` | Tunes context-pressure policy per model/session. Use lower thresholds for fragile work or higher thresholds for large-context models. |
 | `/magneto compact` | Creates a focused compaction request that preserves the things normal summaries often lose: mission, contract fit, evidence ledger, open risks/blockers, active subagents, and todo signal. |
@@ -57,7 +57,7 @@ Daily interface should stay small: usually start with `/magneto start`, check `/
 
 ### Magneto tool
 
-The `magneto` tool is the LLM-facing ledger. Its value is that the worker can continuously report strategic facts back to the supervisor: new outcomes, progress, evidence, risks, blockers, decisions, and subagent job results. That makes Magneto's audits based on durable state rather than whatever happens to fit in the current context window.
+The `magneto` tool is the LLM-facing ledger and scheduler interface. Its value is that the worker can continuously report strategic facts back to the supervisor: new outcomes, progress, evidence, risks, blockers, decisions, subagent job results, and ready-queue state (`get_queue` / `rebuild_queue`). That makes Magneto's audits based on durable state rather than whatever happens to fit in the current context window.
 
 ---
 

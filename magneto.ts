@@ -143,6 +143,18 @@ interface ToolUseHealth {
 	recent: Array<{ toolName: string; ok: boolean; signature: string; at: string }>;
 }
 
+type TodoStatus = "todo" | "inprogress" | "done" | "blocked" | "skipping";
+
+interface TodoSignalItem {
+	id?: number;
+	text: string;
+	status: TodoStatus;
+	priority: number;
+	hierarchyKey: string;
+	parentKey?: string;
+	dependsOnTodoIds: number[];
+}
+
 interface TodoSnapshot {
 	total: number;
 	todo: number;
@@ -150,8 +162,30 @@ interface TodoSnapshot {
 	done: number;
 	blocked: number;
 	skipping: number;
+	items: TodoSignalItem[];
 	source: string;
 	updatedAt: string;
+}
+
+interface WorkQueueItem {
+	id: string;
+	todoId?: number;
+	title: string;
+	status: "ready" | "assigned" | "blocked";
+	priority: number;
+	hierarchyKey: string;
+	parentKey?: string;
+	dependsOnTodoIds: number[];
+	reason: string;
+	assignedJobId?: string;
+}
+
+interface SchedulerState {
+	strategy: "todo-priority";
+	readyQueue: WorkQueueItem[];
+	blockedQueue: WorkQueueItem[];
+	assignedQueue: WorkQueueItem[];
+	lastRebuiltAt?: string;
 }
 
 interface MagnetoContract {
@@ -170,6 +204,7 @@ interface MagnetoContract {
 		preferParallel: boolean;
 		notes?: string;
 	};
+	scheduler: SchedulerState;
 	evidence: Evidence[];
 	subagentJobs: SubagentJob[];
 	risks: Risk[];
@@ -339,6 +374,15 @@ function createProgress(summary = "Contract initialized; strategic progress not 
 	};
 }
 
+function createEmptyScheduler(): SchedulerState {
+	return {
+		strategy: "todo-priority",
+		readyQueue: [],
+		blockedQueue: [],
+		assignedQueue: [],
+	};
+}
+
 function createContract(mission: string, inputs?: Partial<MagnetoContract>): MagnetoContract {
 	const domains = inputs?.domains?.length ? inputs.domains : inferDomains(mission);
 	const primaryGoal: Goal = {
@@ -365,6 +409,7 @@ function createContract(mission: string, inputs?: Partial<MagnetoContract>): Mag
 			maxParallelSubagents: DEFAULT_MAX_PARALLEL_SUBAGENTS,
 			preferParallel: true,
 		},
+		scheduler: inputs?.scheduler ?? createEmptyScheduler(),
 		evidence: inputs?.evidence ?? [],
 		subagentJobs: inputs?.subagentJobs ?? [],
 		risks: inputs?.risks ?? [],
@@ -389,24 +434,78 @@ function addIntervention(contract: MagnetoContract, severity: InterventionSeveri
 	return intervention;
 }
 
+function normalizeTodoStatus(input: any): TodoStatus {
+	const raw = String(input?.status ?? (input?.done ? "done" : "todo")).toLowerCase().replace(/[\s-]+/g, "");
+	if (raw === "inprogress" || raw === "in_progress" || raw === "doing" || raw === "active") return "inprogress";
+	if (raw === "done" || raw === "complete" || raw === "completed") return "done";
+	if (raw === "blocked" || raw === "waiting") return "blocked";
+	if (raw === "skipping" || raw === "skipped" || raw === "skip") return "skipping";
+	return "todo";
+}
+
+function inferTodoPriority(text: string, status: TodoStatus, id?: number): number {
+	let priority = 50;
+	const lower = text.toLowerCase();
+	if (status === "inprogress") priority += 30;
+	if (/\b(p0|critical|urgent|blocker)\b/i.test(text)) priority += 40;
+	else if (/\b(p1|high|ważne|wazne)\b/i.test(text)) priority += 25;
+	else if (/\b(p2|medium)\b/i.test(text)) priority += 10;
+	else if (/\b(p3|low|nice[ -]?to[ -]?have)\b/i.test(text)) priority -= 15;
+	if (/test|lint|build|check|review|verify|validation|audit/.test(lower)) priority += 8;
+	if (/handoff|compact|context|continuity/.test(lower)) priority += 6;
+	if (id !== undefined) priority += Math.max(0, 10 - Math.min(10, Math.floor(id / 10)));
+	return clampScore(priority);
+}
+
+function inferHierarchy(text: string, id?: number): { hierarchyKey: string; parentKey?: string } {
+	const numbered = text.match(/^\s*(\d+(?:\.\d+)+|\d+)[).:\s-]+/);
+	if (numbered) {
+		const key = numbered[1];
+		const parts = key.split(".");
+		return { hierarchyKey: key, parentKey: parts.length > 1 ? parts.slice(0, -1).join(".") : undefined };
+	}
+	const prefix = text.match(/^\s*([A-Za-z0-9][A-Za-z0-9._ /-]{0,32}):\s+/)?.[1]?.trim().toLowerCase();
+	if (prefix) return { hierarchyKey: `${prefix}/${id ?? text.slice(0, 24)}`, parentKey: prefix };
+	return { hierarchyKey: id !== undefined ? `todo-${id}` : text.slice(0, 48) };
+}
+
+function parseTodoDependencies(text: string): number[] {
+	const deps = new Set<number>();
+	for (const match of text.matchAll(/(?:after|depends? on|blocked by|po)\s+#?(\d+)/gi)) {
+		deps.add(Number(match[1]));
+	}
+	return [...deps].filter(Number.isFinite);
+}
+
 function summarizeTodoFromData(data: any, source: string): TodoSnapshot | undefined {
 	if (!data || typeof data !== "object") return undefined;
 	const todos = Array.isArray(data.todos) ? data.todos : Array.isArray(data.items) ? data.items : undefined;
 	if (!todos) return undefined;
 
-	const counts = { todo: 0, inprogress: 0, done: 0, blocked: 0, skipping: 0 };
+	const counts: Record<TodoStatus, number> = { todo: 0, inprogress: 0, done: 0, blocked: 0, skipping: 0 };
+	const items: TodoSignalItem[] = [];
 	for (const item of todos) {
-		const raw = String(item?.status ?? (item?.done ? "done" : "todo")).toLowerCase().replace(/[\s-]+/g, "");
-		if (raw === "inprogress" || raw === "in_progress" || raw === "doing") counts.inprogress += 1;
-		else if (raw === "done" || raw === "complete" || raw === "completed") counts.done += 1;
-		else if (raw === "blocked" || raw === "waiting") counts.blocked += 1;
-		else if (raw === "skipping" || raw === "skipped" || raw === "skip") counts.skipping += 1;
-		else counts.todo += 1;
+		const text = String(item?.text ?? item?.label ?? item?.title ?? "").trim();
+		if (!text) continue;
+		const id = typeof item?.id === "number" ? item.id : Number.isFinite(Number(item?.id)) ? Number(item.id) : undefined;
+		const status = normalizeTodoStatus(item);
+		counts[status] += 1;
+		const hierarchy = inferHierarchy(text, id);
+		items.push({
+			id,
+			text,
+			status,
+			priority: inferTodoPriority(text, status, id),
+			hierarchyKey: hierarchy.hierarchyKey,
+			parentKey: hierarchy.parentKey,
+			dependsOnTodoIds: parseTodoDependencies(text),
+		});
 	}
 
 	return {
-		total: todos.length,
+		total: items.length,
 		...counts,
+		items,
 		source,
 		updatedAt: nowIso(),
 	};
@@ -458,6 +557,67 @@ function queuedJobs(contract: MagnetoContract): SubagentJob[] {
 	return contract.subagentJobs.filter((job) => job.status === "queued");
 }
 
+function ensureScheduler(contract: MagnetoContract): SchedulerState {
+	if (!contract.scheduler) {
+		contract.scheduler = createEmptyScheduler();
+	}
+	contract.scheduler.readyQueue ??= [];
+	contract.scheduler.blockedQueue ??= [];
+	contract.scheduler.assignedQueue ??= [];
+	return contract.scheduler;
+}
+
+function rebuildWorkQueue(contract: MagnetoContract, todo?: TodoSnapshot): SchedulerState {
+	const scheduler = ensureScheduler(contract);
+	const doneTodoIds = new Set((todo?.items ?? []).filter((item) => item.status === "done" || item.status === "skipping").map((item) => item.id).filter((id): id is number => id !== undefined));
+	const activeTodoIds = new Map<number, string>();
+	for (const job of contract.subagentJobs.filter((job) => job.status === "queued" || job.status === "running")) {
+		for (const todoId of job.todoIds) activeTodoIds.set(todoId, job.id);
+	}
+
+	const ready: WorkQueueItem[] = [];
+	const blocked: WorkQueueItem[] = [];
+	const assigned: WorkQueueItem[] = [];
+
+	for (const item of todo?.items ?? []) {
+		if (item.status === "done" || item.status === "skipping") continue;
+		const missingDeps = item.dependsOnTodoIds.filter((dep) => !doneTodoIds.has(dep));
+		const assignedJobId = item.id !== undefined ? activeTodoIds.get(item.id) : undefined;
+		const queueItem: WorkQueueItem = {
+			id: item.id !== undefined ? `todo-${item.id}` : `todo-${item.hierarchyKey}`,
+			todoId: item.id,
+			title: item.text,
+			status: assignedJobId ? "assigned" : item.status === "blocked" || missingDeps.length ? "blocked" : "ready",
+			priority: item.priority,
+			hierarchyKey: item.hierarchyKey,
+			parentKey: item.parentKey,
+			dependsOnTodoIds: item.dependsOnTodoIds,
+			reason: assignedJobId ? `assigned to ${assignedJobId}` : missingDeps.length ? `waiting for todo ${missingDeps.map((id) => `#${id}`).join(", ")}` : item.status === "inprogress" ? "already in progress; good candidate to finish" : "ready from todo priority",
+			assignedJobId,
+		};
+		if (queueItem.status === "assigned") assigned.push(queueItem);
+		else if (queueItem.status === "blocked") blocked.push(queueItem);
+		else ready.push(queueItem);
+	}
+
+	ready.sort((a, b) => b.priority - a.priority || (a.todoId ?? 1_000_000) - (b.todoId ?? 1_000_000));
+	blocked.sort((a, b) => b.priority - a.priority);
+	assigned.sort((a, b) => b.priority - a.priority);
+	scheduler.readyQueue = ready.slice(0, 200);
+	scheduler.blockedQueue = blocked.slice(0, 200);
+	scheduler.assignedQueue = assigned.slice(0, 200);
+	scheduler.lastRebuiltAt = nowIso();
+	return scheduler;
+}
+
+function matchReadyQueueItem(contract: MagnetoContract, text: string): WorkQueueItem | undefined {
+	const lower = text.toLowerCase();
+	const scheduler = ensureScheduler(contract);
+	return scheduler.readyQueue.find((item) => item.todoId !== undefined && lower.includes(`#${item.todoId}`))
+		?? scheduler.readyQueue.find((item) => lower.includes(item.title.toLowerCase().slice(0, Math.min(40, item.title.length))))
+		?? scheduler.readyQueue[0];
+}
+
 function openRisks(contract: MagnetoContract): Risk[] {
 	return contract.risks.filter((risk) => risk.status === "open");
 }
@@ -482,6 +642,9 @@ function updateDerivedProgress(contract: MagnetoContract, todo?: TodoSnapshot, t
 
 	const blockerPenalty = openBlockers(contract).length * 15;
 	const riskPenalty = openRisks(contract).filter((risk) => risk.severity !== "info").length * 8;
+	if (todo) rebuildWorkQueue(contract, todo);
+	else ensureScheduler(contract);
+
 	const failedToolPenalty = toolUse && toolUse.totalCalls > 0 ? Math.min(40, Math.round((toolUse.failedCalls / toolUse.totalCalls) * 100)) : 0;
 	const contractFit = clampScore(100 - blockerPenalty - riskPenalty);
 	const executionHealth = clampScore(100 - failedToolPenalty - toolUseRepeatedPenalty(toolUse));
@@ -510,14 +673,18 @@ function auditContract(contract: MagnetoContract, todo?: TodoSnapshot, toolUse?:
 	const findings: string[] = [];
 	const running = runningJobs(contract).length;
 	const queued = queuedJobs(contract).length;
+	const scheduler = rebuildWorkQueue(contract, todo);
+	const ready = scheduler.readyQueue.length;
 	const capacity = contract.delegationPolicy.maxParallelSubagents;
 
 	if (!contract.outcomes.length) findings.push("No explicit outcomes defined. Add measurable outcomes beyond todo completion.");
 	if (!contract.constraints.length) findings.push("No constraints captured. Add non-negotiables to prevent drift.");
 	if (contract.progress.qualityCoverage < 50) findings.push(`Quality evidence coverage low (${contract.progress.qualityCoverage}%). Add tests/review/council/design-review evidence.`);
 	if (contract.delegationPolicy.preferParallel && running < capacity) {
-		if (queued > 0) {
-			findings.push(`Subagent capacity underused: ${running}/${capacity} running with ${queued} queued.`);
+		if (ready > 0) {
+			findings.push(`Subagent capacity underused: ${running}/${capacity} running with ${ready} ready queue items. Start up to ${Math.min(capacity - running, ready)} more subagents.`);
+		} else if (queued > 0) {
+			findings.push(`Subagent queue has ${queued} queued jobs but only ${running}/${capacity} running; dispatch queued jobs instead of waiting.`);
 		} else if (todo && todo.todo + todo.inprogress >= capacity * 2) {
 			findings.push(`Parallelism likely underused: ${running}/${capacity} subagents running while ${todo.todo + todo.inprogress} actionable todo items remain. Split independent work and delegate up to capacity.`);
 		}
@@ -542,6 +709,7 @@ function formatStatus(state: MagnetoState): string {
 
 	updateDerivedProgress(contract, state.lastTodoSnapshot, state.toolUse);
 	const findings = auditContract(contract, state.lastTodoSnapshot, state.toolUse).slice(0, 8);
+	const scheduler = ensureScheduler(contract);
 	const activeJobs = contract.subagentJobs.filter((job) => job.status === "queued" || job.status === "running");
 
 	const lines = [
@@ -551,12 +719,19 @@ function formatStatus(state: MagnetoState): string {
 		`Domains: ${contract.domains.join(", ")}`,
 		`Progress: goal=${formatPercent(contract.progress.goalCompletion)} contractFit=${formatPercent(contract.progress.contractFit)} quality=${formatPercent(contract.progress.qualityCoverage)} health=${formatPercent(contract.progress.executionHealth)} parallelism=${formatPercent(contract.progress.parallelism)}`,
 		`Todo: ${state.lastTodoSnapshot ? `${state.lastTodoSnapshot.done}/${state.lastTodoSnapshot.total} done, ${state.lastTodoSnapshot.inprogress} in progress, ${state.lastTodoSnapshot.blocked} blocked` : "unknown"}`,
-		`Subagents: ${runningJobs(contract).length}/${contract.delegationPolicy.maxParallelSubagents} running, ${queuedJobs(contract).length} queued`,
+		`Subagents: ${runningJobs(contract).length}/${contract.delegationPolicy.maxParallelSubagents} running, ${queuedJobs(contract).length} queued | ready work: ${scheduler.readyQueue.length}`,
 		`Risks: ${openRisks(contract).length} open | Blockers: ${openBlockers(contract).length} open | Evidence: ${contract.evidence.length}`,
 		"",
 		"## Strategic findings",
 		...findings.map((finding) => `- ${finding}`),
 	];
+
+	if (scheduler.readyQueue.length) {
+		lines.push("", "## Ready work queue (top priority)");
+		for (const item of scheduler.readyQueue.slice(0, 12)) {
+			lines.push(`- P${item.priority} ${item.todoId ? `#${item.todoId} ` : ""}${item.title} (${item.reason})`);
+		}
+	}
 
 	if (activeJobs.length) {
 		lines.push("", "## Active subagent jobs");
@@ -581,6 +756,8 @@ function buildSupervisorPrompt(state: MagnetoState): string {
 	const capacity = contract.delegationPolicy.maxParallelSubagents;
 	const running = runningJobs(contract).length;
 	const queued = queuedJobs(contract).length;
+	const scheduler = ensureScheduler(contract);
+	const readyQueueText = scheduler.readyQueue.slice(0, Math.max(1, capacity - running)).map((item) => `- P${item.priority} ${item.todoId ? `#${item.todoId} ` : ""}${item.title}`).join("\n");
 	const activePolicies = contract.skillPolicy
 		.filter((policy) => contract.domains.includes(policy.domain) || policy.domain === "code")
 		.slice(0, 8)
@@ -592,7 +769,8 @@ function buildSupervisorPrompt(state: MagnetoState): string {
 		"Magneto is the strategic control plane. Todo is tactical; do not treat todo completion as goal completion.",
 		`Mission: ${contract.mission}`,
 		`Strategic progress: goal=${contract.progress.goalCompletion}%, contractFit=${contract.progress.contractFit}%, quality=${contract.progress.qualityCoverage}%, executionHealth=${contract.progress.executionHealth}%.`,
-		`Subagent capacity target: keep up to ${capacity} independent subagents busy. Currently ${running}/${capacity} running, ${queued} queued. If independent work exists and capacity remains, delegate via subagent and record it with the magneto tool.`,
+		`Subagent capacity target: keep up to ${capacity} independent subagents busy. Currently ${running}/${capacity} running, ${queued} queued, ${scheduler.readyQueue.length} ready. Do not wait for all agents to finish: whenever a slot is free, assign the next ready queue item.`,
+		`Ready queue to dispatch next:\n${readyQueueText || "- No ready items derived from todo; list/refine todo or create queued subagent jobs."}`,
 		`Todo signal: ${state.lastTodoSnapshot ? `${state.lastTodoSnapshot.done}/${state.lastTodoSnapshot.total} done; ${state.lastTodoSnapshot.blocked} blocked` : "unknown; call todo list if execution state matters"}.`,
 		"\nNon-negotiable supervisor rules:",
 		"- Keep execution aligned to the Magneto mission, outcomes, constraints, and quality bars.",
@@ -614,6 +792,7 @@ function buildHandoffPrompt(state: MagnetoState): string {
 	if (!contract) return "# Magneto Handoff\nNo active contract.";
 	updateDerivedProgress(contract, state.lastTodoSnapshot, state.toolUse);
 	const audit = auditContract(contract, state.lastTodoSnapshot, state.toolUse);
+	const scheduler = ensureScheduler(contract);
 	return [
 		"# Magneto Continuation Prompt",
 		"You are continuing a long-running supervised execution. Treat the Magneto contract below as the source of truth.",
@@ -634,6 +813,9 @@ function buildHandoffPrompt(state: MagnetoState): string {
 		"",
 		"## Active todo signal",
 		state.lastTodoSnapshot ? `- ${state.lastTodoSnapshot.done}/${state.lastTodoSnapshot.total} done; ${state.lastTodoSnapshot.todo} todo; ${state.lastTodoSnapshot.inprogress} in progress; ${state.lastTodoSnapshot.blocked} blocked.` : "- Unknown; call todo list.",
+		"",
+		"## Ready work queue",
+		...(scheduler.readyQueue.slice(0, 16).map((item) => `- P${item.priority} ${item.todoId ? `#${item.todoId} ` : ""}${item.title} — ${item.reason}`)),
 		"",
 		"## Active subagent jobs",
 		...(contract.subagentJobs.filter((j) => j.status === "queued" || j.status === "running").map((j) => `- [${j.status}] ${j.id} ${j.agent}: ${j.title}`) || []),
@@ -848,19 +1030,22 @@ export default function magnetoExtension(pi: ExtensionAPI): void {
 		toolCallSignatures.set(event.toolCallId, { toolName: event.toolName, signature, at: nowIso() });
 		if (event.toolName === "subagent" && state.contract) {
 			const input = event.input as any;
+			rebuildWorkQueue(state.contract, state.lastTodoSnapshot);
 			const tasks = Array.isArray(input?.tasks) ? input.tasks : input?.task ? [{ agent: input.agent ?? "subagent", task: input.task }] : [];
 			const jobIds: string[] = [];
 			for (const task of tasks) {
+				const taskText = String(task.task ?? "subagent task");
+				const queueItem = matchReadyQueueItem(state.contract, taskText);
 				const id = makeId("job");
 				jobIds.push(id);
 				state.contract.subagentJobs.push({
 					id,
-					title: String(task.task ?? "subagent task"),
+					title: taskText,
 					agent: String(task.agent ?? input?.agent ?? "subagent"),
 					status: "running",
-					priority: 1,
+					priority: queueItem?.priority ?? 1,
 					dependsOn: [],
-					todoIds: [],
+					todoIds: queueItem?.todoId !== undefined ? [queueItem.todoId] : [],
 					evidenceIds: [],
 					deliverables: [],
 					createdAt: nowIso(),
@@ -868,6 +1053,7 @@ export default function magnetoExtension(pi: ExtensionAPI): void {
 				});
 			}
 			if (jobIds.length) subagentToolJobs.set(event.toolCallId, jobIds);
+			rebuildWorkQueue(state.contract, state.lastTodoSnapshot);
 			state.contract.updatedAt = nowIso();
 			persist();
 		}
@@ -878,7 +1064,7 @@ export default function magnetoExtension(pi: ExtensionAPI): void {
 		if (event.toolName === "todo" || event.toolName === "todo_sidebar" || event.toolName === "todo-sidebar") {
 			const result = event.result as any;
 			state.lastTodoSnapshot = summarizeTodoFromData(result?.details ?? result, `tool:${event.toolName}`) ?? state.lastTodoSnapshot;
-			refreshTodoSignal(ctx);
+			if (state.contract) updateDerivedProgress(state.contract, state.lastTodoSnapshot, state.toolUse);
 		}
 		if (event.toolName === "subagent" && state.contract) {
 			const jobIds = subagentToolJobs.get(event.toolCallId) ?? [];
@@ -935,6 +1121,8 @@ export default function magnetoExtension(pi: ExtensionAPI): void {
 				"update_job",
 				"audit",
 				"get_status",
+				"get_queue",
+				"rebuild_queue",
 			] as const),
 			mission: Type.Optional(Type.String()),
 			domains: Type.Optional(Type.Array(Enum(["code", "frontend", "design", "infra", "research", "refactor", "data", "docs", "unknown"] as const))),
@@ -964,6 +1152,7 @@ export default function magnetoExtension(pi: ExtensionAPI): void {
 			job_title: Type.Optional(Type.String()),
 			job_agent: Type.Optional(Type.String()),
 			job_status: Type.Optional(Enum(["queued", "running", "done", "failed", "blocked", "cancelled"] as const)),
+			todo_ids: Type.Optional(Type.Array(Type.Integer())),
 			deliverables: Type.Optional(Type.Array(Type.String())),
 			result: Type.Optional(Type.String()),
 			capacity: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
@@ -995,6 +1184,15 @@ export default function magnetoExtension(pi: ExtensionAPI): void {
 
 			if (!state.contract) return { content: [{ type: "text", text: "No active Magneto contract. Use magneto action=init first." }], details: { action, error: "no contract" } };
 			const contract = state.contract;
+
+			if (action === "get_queue" || action === "rebuild_queue") {
+				const scheduler = rebuildWorkQueue(contract, state.lastTodoSnapshot);
+				persist();
+				return {
+					content: [{ type: "text", text: [`Ready queue: ${scheduler.readyQueue.length}`, ...scheduler.readyQueue.slice(0, 20).map((item) => `- P${item.priority} ${item.todoId ? `#${item.todoId} ` : ""}${item.title} — ${item.reason}`)].join("\n") }],
+					details: { action, scheduler },
+				};
+			}
 
 			switch (action) {
 				case "set_contract": {
@@ -1079,7 +1277,9 @@ export default function magnetoExtension(pi: ExtensionAPI): void {
 				}
 				case "add_job": {
 					if (!args.job_title || !args.job_agent) return { content: [{ type: "text", text: "❌ add_job requires job_title and job_agent" }], details: { action, error: "missing job" } };
-					contract.subagentJobs.push({ id: args.job_id || makeId("job"), title: args.job_title, agent: args.job_agent, status: args.job_status ?? "queued", priority: 1, dependsOn: [], todoIds: [], evidenceIds: [], deliverables: asArrayOfStrings(args.deliverables), result: args.result, createdAt: nowIso(), startedAt: args.job_status === "running" ? nowIso() : undefined });
+					const matched = matchReadyQueueItem(contract, args.job_title);
+					const todoIds = Array.isArray(args.todo_ids) ? args.todo_ids.filter(Number.isFinite) : matched?.todoId !== undefined ? [matched.todoId] : [];
+					contract.subagentJobs.push({ id: args.job_id || makeId("job"), title: args.job_title, agent: args.job_agent, status: args.job_status ?? "queued", priority: matched?.priority ?? 1, dependsOn: [], todoIds, evidenceIds: [], deliverables: asArrayOfStrings(args.deliverables), result: args.result, createdAt: nowIso(), startedAt: args.job_status === "running" ? nowIso() : undefined });
 					break;
 				}
 				case "update_job": {
