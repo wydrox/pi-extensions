@@ -56,7 +56,10 @@ export default function (pi: ExtensionAPI) {
     }),
     execute: async (_id, params, _signal, _onUpdate, _ctx) => {
       const question = params.question as string;
-      const output = await executeCouncilRaw(question);
+      const output = await executeCouncilRaw(question, (line) => {
+        // Stream progress back to parent pi so the native tool spinner shows status
+        _onUpdate?.({ content: [{ type: "text", text: line }] });
+      });
       return {
         content: [{ type: "text", text: output }],
       };
@@ -69,18 +72,36 @@ export default function (pi: ExtensionAPI) {
     // Best-effort status — may not be available in tool mode
   };
 
-  async function executeCouncilRaw(rawArgs: string): Promise<string> {
+  async function executeCouncilRaw(
+    rawArgs: string,
+    onStream?: (line: string) => void,
+  ): Promise<string> {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
+    const t0 = Date.now();
+    let lastPhase = "";
+    let phaseStart = t0;
+    const spinners = ["◐", "◓", "◑", "◒"];
+    let spinIdx = 0;
+
     const result = await runCouncil(rawArgs, (update) => {
-      const detail = update.detail ? ` · ${update.detail.slice(0, 80)}` : "";
+      const now = Date.now();
+      if (update.phase !== lastPhase) {
+        phaseStart = now;
+        lastPhase = update.phase;
+      }
+      const phaseMs = now - phaseStart;
+      const totalMs = now - t0;
+      const phaseSec = phaseMs < 1000 ? `${phaseMs}ms` : `${(phaseMs / 1000).toFixed(1)}s`;
+      const totalSec = totalMs < 1000 ? `${totalMs}ms` : `${(totalMs / 1000).toFixed(1)}s`;
+      const detail = update.detail ? ` · ${update.detail.slice(0, 60)}` : "";
       const progress = update.progress
         ? ` [${update.progress.current}/${update.progress.total}]`
         : "";
-      // In tool mode, we can't update UI. Just log to stderr.
-      process.stderr.write(
-        `[council:${update.phase}] ${update.message}${detail}${progress}\n`,
-      );
+      const spinner = update.phase === "done" || update.phase === "error" ? "✓" : spinners[spinIdx++ % spinners.length];
+      const line = `${spinner} [${totalSec}] council:${update.phase.padEnd(12)} ${update.message}${detail}${progress} (${phaseSec})`;
+      process.stderr.write(line + "\n");
+      onStream?.(line);
     });
 
     const output = formatCouncilResult(result);
@@ -100,18 +121,37 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("council", "Starting...");
 
     try {
-      let lastCards = 0;
+      const t0 = Date.now();
+      let lastPhase = "";
+      let phaseStart = t0;
+      const spinners = ["◐", "◓", "◑", "◒"];
+      let spinIdx = 0;
+
       const result = await runCouncil(args, (update) => {
+        const now = Date.now();
+        if (update.phase !== lastPhase) {
+          phaseStart = now;
+          lastPhase = update.phase;
+        }
+        const phaseMs = now - phaseStart;
+        const totalMs = now - t0;
+        const phaseSec = phaseMs < 1000 ? `${phaseMs}ms` : `${(phaseMs / 1000).toFixed(1)}s`;
+        const totalSec = totalMs < 1000 ? `${totalMs}ms` : `${(totalMs / 1000).toFixed(1)}s`;
+        const spinner = update.phase === "done" || update.phase === "error" ? "✓" : spinners[spinIdx++ % spinners.length];
+        const progress = update.progress
+          ? ` [${update.progress.current}/${update.progress.total}]`
+          : "";
+
         switch (update.phase) {
           case "moderator":
-            ctx.ui.setStatus("council", "Moderator analyzing…");
+            ctx.ui.setStatus("council", `${spinner} Moderator ${totalSec} (${phaseSec})`);
             break;
           case "cards":
             if (update.progress) {
-              lastCards = update.progress.current;
+              lastPhase = update.progress.current;
               ctx.ui.setStatus(
                 "council",
-                `Cards [${update.progress.current}/${update.progress.total}]…`,
+                `${spinner} Cards [${update.progress.current}/${update.progress.total}] ${totalSec} (${phaseSec})`,
               );
             }
             break;
@@ -119,27 +159,27 @@ export default function (pi: ExtensionAPI) {
             if (update.progress) {
               ctx.ui.setStatus(
                 "council",
-                `Ranking [${update.progress.current}/${update.progress.total}]…`,
+                `${spinner} Ranking [${update.progress.current}/${update.progress.total}] ${totalSec} (${phaseSec})`,
               );
             }
             break;
           case "aggregate":
-            ctx.ui.setStatus("council", "Aggregating (Borda)…");
+            ctx.ui.setStatus("council", `${spinner} Aggregating ${totalSec} (${phaseSec})`);
             break;
           case "synthesize":
-            ctx.ui.setStatus("council", "Synthesizing…");
+            ctx.ui.setStatus("council", `${spinner} Synthesizing ${totalSec} (${phaseSec})`);
             break;
           case "done":
             ctx.ui.setStatus(
               "council",
-              `Done · ${result.meta.cardsGenerated}C · ${(result.meta.durationMs / 1000).toFixed(1)}s`,
+              `✓ Done · ${result.meta.cardsGenerated}C · ${(result.meta.durationMs / 1000).toFixed(1)}s`,
             );
             break;
           case "error":
             ctx.ui.notify(update.message, "error");
             break;
           default:
-            ctx.ui.setStatus("council", update.message);
+            ctx.ui.setStatus("council", `${spinner} ${update.message} ${totalSec} (${phaseSec})`);
         }
       });
 

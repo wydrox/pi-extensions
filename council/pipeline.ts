@@ -30,7 +30,7 @@ import {
   runSynthesis,
   runModerator,
   type SpawnResult,
-} from "./pi-spawner.js";
+} from "./pi-council.js";
 import {
   bordaAggregate,
   applyCoverageRules,
@@ -121,6 +121,20 @@ function parseAtFiles(rawArgs: string): string[] {
   });
 }
 
+/** Max file size for evidence (bytes) */
+const MAX_EVIDENCE_SIZE = 100_000;
+
+function isReasonableEvidenceFile(p: string): boolean {
+  try {
+    const stats = fs.statSync(p);
+    if (!stats.isFile()) return false;
+    if (stats.size > MAX_EVIDENCE_SIZE) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Collect default evidence files from the project */
 function gatherDefaultEvidence(cwd: string): string[] {
   const files: string[] = [];
@@ -134,7 +148,7 @@ function gatherDefaultEvidence(cwd: string): string[] {
     ".pi/settings.json",
   ]) {
     const p = path.join(cwd, name);
-    if (fs.existsSync(p)) files.push(p);
+    if (isReasonableEvidenceFile(p)) files.push(p);
   }
 
   try {
@@ -146,8 +160,8 @@ function gatherDefaultEvidence(cwd: string): string[] {
     });
     const changed = diffOut
       .split("\n")
-      .filter((f) => f.trim() && fs.existsSync(path.join(cwd, f.trim())))
-      .slice(0, 15)
+      .filter((f) => f.trim() && isReasonableEvidenceFile(path.join(cwd, f.trim())))
+      .slice(0, 10)
       .map((f) => path.join(cwd, f.trim()));
     files.push(...changed);
   } catch {
@@ -167,8 +181,8 @@ function gatherDefaultEvidence(cwd: string): string[] {
         (l) => l.startsWith("??") || l.startsWith("A ") || l.startsWith("AM"),
       )
       .map((l) => l.slice(3).trim())
-      .filter((f) => f && fs.existsSync(path.join(cwd, f)))
-      .slice(0, 10)
+      .filter((f) => f && isReasonableEvidenceFile(path.join(cwd, f)))
+      .slice(0, 5)
       .map((f) => path.join(cwd, f));
     files.push(...untracked);
   } catch {
@@ -187,11 +201,11 @@ function parseParams(rawArgs: string): CouncilParams {
   const atFiles = parseAtFiles(rawArgs);
   const explicitEvidence =
     atFiles.length > 0
-      ? atFiles
+      ? atFiles.filter(isReasonableEvidenceFile)
       : [];
   const defaultEvidence =
     explicitEvidence.length === 0 ? gatherDefaultEvidence(process.cwd()) : [];
-  const allEvidence = [...explicitEvidence, ...defaultEvidence].slice(0, 30);
+  const allEvidence = [...explicitEvidence, ...defaultEvidence].slice(0, 15);
 
   const question = rawArgs
     .replace(/@\S+/g, "")
@@ -287,9 +301,12 @@ async function generateCards(
     }
   }
 
-  // Retry failed experts (sequential to avoid hammering API)
-  if (retryFailed && failedExperts.length > 0) {
-    for (const expert of failedExperts) {
+  // Retry failed experts only if they didn't time out (timeouts rarely fix on retry)
+  const nonTimeoutFailures = failedExperts.filter((e) =>
+    !errors.some((err) => err.startsWith(e.name) && err.includes("timeout"))
+  );
+  if (retryFailed && nonTimeoutFailures.length > 0) {
+    for (const expert of nonTimeoutFailures) {
       const retryCards = await runOneExpert(expert, true);
       if (retryCards && retryCards.length > 0) {
         allCards.push(...retryCards);
