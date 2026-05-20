@@ -66,7 +66,7 @@ List the best files, tests, commands, docs, issues, user instructions, or other 
 List unresolved questions that block or materially affect the next step. Otherwise write None.`;
 
 const HANDOFF_STATE_TYPE = "handoff-state";
-const CARRYOVER_CUSTOM_TYPES = ["todo-state", "ralph-loop-state", "fast-state"] as const;
+const CARRYOVER_CUSTOM_TYPES = ["todo-state", "ralph-loop-state", "fast-state", "ralph-contract-state"] as const;
 
 function isCarryoverCustomType(customType: string): boolean {
 	return CARRYOVER_CUSTOM_TYPES.includes(customType as (typeof CARRYOVER_CUSTOM_TYPES)[number]);
