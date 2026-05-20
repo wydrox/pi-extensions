@@ -122,7 +122,10 @@ async function runHandoffCommand(commandName: "handoff", args: string, ctx: Exte
 		const doGenerate = async () => {
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 			if (!auth.ok || !auth.apiKey) {
-				throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
+				const authError = auth.ok
+					? `No API key for ${model.provider}`
+					: String((auth as { error?: unknown }).error ?? `Auth failed for ${model.provider}`);
+				throw new Error(authError);
 			}
 
 			const userMessage: Message = {
@@ -181,7 +184,7 @@ async function runHandoffCommand(commandName: "handoff", args: string, ctx: Exte
 	const carriedCustomTypes = carryoverEntries.map((entry) => entry.customType);
 
 	// Create a clean child session: old conversation is not copied, only allowlisted custom state.
-	const newSessionResult = await ctx.newSession({
+	const newSessionResult = await (ctx.newSession as any)({
 		parentSession: currentSessionFile,
 		setup: async (session) => {
 			session.appendCustomEntry(HANDOFF_STATE_TYPE, {

@@ -35,6 +35,28 @@ These are original work, not based on pi's example templates.
 | `status-bar.ts` | Enhanced status bar showing token usage, model name, and shortened cwd. Updates per-turn with context-window stats. |
 | `tps.ts` | Tracks tokens-per-second (TPS) for assistant responses. Measures wall-clock time and estimates throughput. |
 
+### Magneto commands
+
+Magneto is a supervisor/control-plane for very long sessions. It coordinates strategy above todo, keeps the cross-domain contract as the source of truth, and monitors execution quality.
+
+| Command | What it does |
+|---------|-------------|
+| `/magneto start <mission>` | Creates a new Magneto contract for the long-running mission, infers domains, initializes goals/quality bars/skill policy, and enables supervision. |
+| `/magneto status` | Writes a full supervisor status report to the editor: mission, strategic scores, todo signal, subagent capacity, risks, blockers, evidence, and governance findings. |
+| `/magneto audit` | Recomputes strategic progress and governance findings, then writes the audit report to the editor. Use when execution feels drifted or before handoff/summary. |
+| `/magneto supervise on\|off` | Enables/disables active supervisor prompt injection. Off keeps state available but stops Magneto from steering the agent. |
+| `/magneto mode observe\|supervise\|strict` | Sets supervision mode. `observe` is passive, `supervise` injects guidance, `strict` is reserved for stronger policy enforcement. |
+| `/magneto capacity <N>` | Sets max intended parallel subagent capacity and influences under-utilization warnings. |
+| `/magneto auto-compact on\|off` | Toggles automatic compact when context crosses the compact threshold. |
+| `/magneto threshold <compactTokens> [handoffTokens]` | Sets token thresholds for compact recommendation/auto-compact and handoff warning. |
+| `/magneto compact` | Requests compaction with Magneto-specific instructions to preserve contract, evidence, blockers, risks, active jobs, and todo signal. |
+| `/magneto handoff` | Creates a clean child session carrying Magneto state, todo, ralph-loop, fast-mode, and legacy contract state; writes a continuation prompt to the editor. |
+| `/magneto reset` | Clears Magneto state and returns to defaults. |
+
+### Magneto tool
+
+The `magneto` tool lets the LLM keep supervisor state current: initialize/update the contract, add goals/outcomes, update strategic progress, record evidence, risks, blockers, decisions, and track subagent jobs.
+
 ---
 
 ## Stock-based extensions
