@@ -39,23 +39,23 @@ These are original work, not based on pi's example templates.
 
 Magneto is a supervisor/control-plane for very long sessions. It coordinates strategy above todo, keeps the cross-domain contract as the source of truth, and monitors execution quality.
 
-| Command | What it does |
-|---------|-------------|
-| `/magneto start <mission>` | Creates a new Magneto contract for the long-running mission, infers domains, initializes goals/quality bars/skill policy, and enables supervision. |
-| `/magneto status` | Writes a full supervisor status report to the editor: mission, strategic scores, todo signal, subagent capacity, risks, blockers, evidence, and governance findings. |
-| `/magneto audit` | Recomputes strategic progress and governance findings, then writes the audit report to the editor. Use when execution feels drifted or before handoff/summary. |
-| `/magneto supervise on\|off` | Enables/disables active supervisor prompt injection. Off keeps state available but stops Magneto from steering the agent. |
-| `/magneto mode observe\|supervise\|strict` | Sets supervision mode. `observe` is passive, `supervise` injects guidance, `strict` is reserved for stronger policy enforcement. |
-| `/magneto capacity <N>` | Sets max intended parallel subagent capacity and influences under-utilization warnings. |
-| `/magneto auto-compact on\|off` | Toggles automatic compact when context crosses the compact threshold. |
-| `/magneto threshold <compactTokens> [handoffTokens]` | Sets token thresholds for compact recommendation/auto-compact and handoff warning. |
-| `/magneto compact` | Requests compaction with Magneto-specific instructions to preserve contract, evidence, blockers, risks, active jobs, and todo signal. |
-| `/magneto handoff` | Creates a clean child session carrying Magneto state, todo, ralph-loop, fast-mode, and legacy contract state; writes a continuation prompt to the editor. |
-| `/magneto reset` | Clears Magneto state and returns to defaults. |
+| Command | Value in a long-running session |
+|---------|---------------------------------|
+| `/magneto start <mission>` | Turns a vague long session into a supervised mission. It creates the strategic contract that everything else is judged against, so 500 todo items do not become disconnected busywork. |
+| `/magneto status` | Gives you a control-room view instead of a task list: are we closer to the mission, is quality covered, are subagents underused, are blockers/risk/evidence visible? Use it to decide whether to continue, redirect, or stop. |
+| `/magneto audit` | A drift detector. It forces Magneto to compare execution against the contract and surface gaps like missing outcomes, low evidence coverage, repeated tool failures, blocked todos, or unused parallel capacity. |
+| `/magneto supervise on\|off` | Lets you switch between passive state tracking and active steering. Use `on` when the model needs guardrails; use `off` when you want Magneto to remember state but not influence prompts. |
+| `/magneto mode observe\|supervise\|strict` | Controls how hard Magneto governs. `observe` watches only, `supervise` nudges the worker with contract/policy guidance, `strict` is intended for higher-friction enforcement when mistakes are expensive. |
+| `/magneto capacity <N>` | Makes parallelism explicit. Magneto can warn when there are queued/independent tasks but too few running subagents, helping you keep long backlogs moving at maximum safe throughput. |
+| `/magneto auto-compact on\|off` | Protects very long sessions from context rot. When enabled, Magneto requests compact before context pressure makes the model forget the contract or repeat stale reasoning. |
+| `/magneto threshold <compactTokens> [handoffTokens]` | Tunes context-pressure policy per model/session. Use lower thresholds for fragile work or higher thresholds for large-context models. |
+| `/magneto compact` | Creates a focused compaction request that preserves the things normal summaries often lose: mission, contract fit, evidence ledger, open risks/blockers, active subagents, and todo signal. |
+| `/magneto handoff` | The clean-session escape hatch. Use when context is polluted or too large: it creates a child session with Magneto/todo/ralph/fast state carried over and a continuation prompt centered on the contract. |
+| `/magneto reset` | Clears stale governance when the mission changed enough that old constraints/evidence would mislead execution. |
 
 ### Magneto tool
 
-The `magneto` tool lets the LLM keep supervisor state current: initialize/update the contract, add goals/outcomes, update strategic progress, record evidence, risks, blockers, decisions, and track subagent jobs.
+The `magneto` tool is the LLM-facing ledger. Its value is that the worker can continuously report strategic facts back to the supervisor: new outcomes, progress, evidence, risks, blockers, decisions, and subagent job results. That makes Magneto's audits based on durable state rather than whatever happens to fit in the current context window.
 
 ---
 
