@@ -37,7 +37,9 @@ These are original work, not based on pi's example templates.
 
 ### Magneto commands
 
-Magneto is a supervisor/control-plane for very long sessions. It coordinates strategy above todo, keeps the cross-domain contract as the source of truth, and monitors execution quality.
+Magneto is a supervisor/control-plane for very long sessions. It coordinates strategy above todo, keeps the cross-domain contract as the source of truth, monitors execution quality, and tries to keep independent work parallelized up to the default capacity of **8 subagents**.
+
+Daily interface should stay small: usually start with `/magneto start`, check `/magneto status` or `/magneto audit`, and use `/magneto handoff` when the session gets too large. The other commands are operational knobs for unusual cases.
 
 | Command | Value in a long-running session |
 |---------|---------------------------------|
@@ -46,7 +48,7 @@ Magneto is a supervisor/control-plane for very long sessions. It coordinates str
 | `/magneto audit` | A drift detector. It forces Magneto to compare execution against the contract and surface gaps like missing outcomes, low evidence coverage, repeated tool failures, blocked todos, or unused parallel capacity. |
 | `/magneto supervise on\|off` | Lets you switch between passive state tracking and active steering. Use `on` when the model needs guardrails; use `off` when you want Magneto to remember state but not influence prompts. |
 | `/magneto mode observe\|supervise\|strict` | Controls how hard Magneto governs. `observe` watches only, `supervise` nudges the worker with contract/policy guidance, `strict` is intended for higher-friction enforcement when mistakes are expensive. |
-| `/magneto capacity <N>` | Makes parallelism explicit. Magneto can warn when there are queued/independent tasks but too few running subagents, helping you keep long backlogs moving at maximum safe throughput. |
+| `/magneto capacity <N>` | Overrides the default **8** subagent target. Magneto uses this to detect under-parallelized execution and nudge the worker to split independent work instead of grinding serially. |
 | `/magneto auto-compact on\|off` | Protects very long sessions from context rot. When enabled, Magneto requests compact before context pressure makes the model forget the contract or repeat stale reasoning. |
 | `/magneto threshold <compactTokens> [handoffTokens]` | Tunes context-pressure policy per model/session. Use lower thresholds for fragile work or higher thresholds for large-context models. |
 | `/magneto compact` | Creates a focused compaction request that preserves the things normal summaries often lose: mission, contract fit, evidence ledger, open risks/blockers, active subagents, and todo signal. |

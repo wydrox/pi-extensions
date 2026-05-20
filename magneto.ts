@@ -205,6 +205,7 @@ const CARRYOVER_TYPES = [MAGNETO_STATE_TYPE, LEGACY_CONTRACT_STATE_TYPE, "todo-s
 const MAX_RECENT_TOOL_CALLS = 40;
 const MAX_INTERVENTIONS = 80;
 const MAX_EVIDENCE = 200;
+const DEFAULT_MAX_PARALLEL_SUBAGENTS = 8;
 
 const DEFAULT_STATE: MagnetoState = {
 	version: 2,
@@ -361,7 +362,7 @@ function createContract(mission: string, inputs?: Partial<MagnetoContract>): Mag
 		qualityBars: inputs?.qualityBars?.length ? inputs.qualityBars : DEFAULT_QUALITY_BARS.filter((bar) => domains.includes(bar.domain) || bar.domain === "code"),
 		skillPolicy: inputs?.skillPolicy?.length ? inputs.skillPolicy : DEFAULT_SKILL_POLICY.filter((policy) => domains.includes(policy.domain) || policy.domain === "code"),
 		delegationPolicy: inputs?.delegationPolicy ?? {
-			maxParallelSubagents: 4,
+			maxParallelSubagents: DEFAULT_MAX_PARALLEL_SUBAGENTS,
 			preferParallel: true,
 		},
 		evidence: inputs?.evidence ?? [],
@@ -514,8 +515,12 @@ function auditContract(contract: MagnetoContract, todo?: TodoSnapshot, toolUse?:
 	if (!contract.outcomes.length) findings.push("No explicit outcomes defined. Add measurable outcomes beyond todo completion.");
 	if (!contract.constraints.length) findings.push("No constraints captured. Add non-negotiables to prevent drift.");
 	if (contract.progress.qualityCoverage < 50) findings.push(`Quality evidence coverage low (${contract.progress.qualityCoverage}%). Add tests/review/council/design-review evidence.`);
-	if (todo && todo.total > 30 && contract.delegationPolicy.preferParallel && running < capacity && queued > 0) {
-		findings.push(`Subagent capacity underused: ${running}/${capacity} running with ${queued} queued.`);
+	if (contract.delegationPolicy.preferParallel && running < capacity) {
+		if (queued > 0) {
+			findings.push(`Subagent capacity underused: ${running}/${capacity} running with ${queued} queued.`);
+		} else if (todo && todo.todo + todo.inprogress >= capacity * 2) {
+			findings.push(`Parallelism likely underused: ${running}/${capacity} subagents running while ${todo.todo + todo.inprogress} actionable todo items remain. Split independent work and delegate up to capacity.`);
+		}
 	}
 	if (todo && todo.blocked > 0) findings.push(`${todo.blocked} todo items are blocked; classify as blocker/risk or unblock.`);
 	if (toolUse && toolUse.failedCalls >= 3) findings.push(`Tool health degraded: ${toolUse.failedCalls}/${toolUse.totalCalls} calls failed.`);
@@ -587,11 +592,12 @@ function buildSupervisorPrompt(state: MagnetoState): string {
 		"Magneto is the strategic control plane. Todo is tactical; do not treat todo completion as goal completion.",
 		`Mission: ${contract.mission}`,
 		`Strategic progress: goal=${contract.progress.goalCompletion}%, contractFit=${contract.progress.contractFit}%, quality=${contract.progress.qualityCoverage}%, executionHealth=${contract.progress.executionHealth}%.`,
-		`Subagent capacity: ${running}/${capacity} running, ${queued} queued. If useful work is independent and capacity remains, delegate via subagent and record it with the magneto tool.`,
+		`Subagent capacity target: keep up to ${capacity} independent subagents busy. Currently ${running}/${capacity} running, ${queued} queued. If independent work exists and capacity remains, delegate via subagent and record it with the magneto tool.`,
 		`Todo signal: ${state.lastTodoSnapshot ? `${state.lastTodoSnapshot.done}/${state.lastTodoSnapshot.total} done; ${state.lastTodoSnapshot.blocked} blocked` : "unknown; call todo list if execution state matters"}.`,
 		"\nNon-negotiable supervisor rules:",
 		"- Keep execution aligned to the Magneto mission, outcomes, constraints, and quality bars.",
 		"- Use todo for tactical queue management, but update Magneto for strategic progress, evidence, risks, blockers, decisions, and subagent jobs.",
+		"- Maximize safe parallelism: keep independent subagent work saturated up to capacity before continuing serially.",
 		"- If the work is non-trivial, use the appropriate skill/tool policy instead of improvising.",
 		"- If tool use starts failing repeatedly, stop retrying blindly; diagnose, change strategy, or ask for a decision.",
 		"- Before summary, ensure evidence covers tests/review/design-review/council as required by domain.",
