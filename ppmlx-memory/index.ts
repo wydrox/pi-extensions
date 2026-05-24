@@ -75,6 +75,79 @@ function getProjectId(): string {
 
 type CliResult = { stdout: string; stderr: string; code: number; ok: boolean };
 
+type MemoryItem = {
+	type: string;
+	subject: string;
+	predicate: string;
+	object: string;
+	text: string;
+	scope: string;
+	confidence?: number;
+	valid_from?: string;
+	valid_to?: string;
+};
+
+const MemoryItemSchema = Type.Object({
+	type: Type.String({ description: "fact, preference, decision, todo, constraint, instruction, entity_note, relationship, workflow_state" }),
+	subject: Type.String({ description: "Short stable subject" }),
+	predicate: Type.String({ description: "Relation or action" }),
+	object: Type.String({ description: "Object value" }),
+	text: Type.String({ description: "One sentence describing the memory" }),
+	scope: Type.String({ description: "global, project, or session" }),
+	confidence: Type.Optional(Type.Number({ description: "0.0-1.0 (default 0.9)" })),
+	valid_from: Type.Optional(Type.String({ description: "ISO timestamp when the memory became valid" })),
+	valid_to: Type.Optional(Type.String({ description: "ISO timestamp when the memory expires" })),
+});
+
+const MemoryAddParametersSchema = Type.Object({
+	items: Type.Optional(Type.Array(MemoryItemSchema, {
+		description: "Batch of durable memory facts. Use this whenever two or more facts are known now; batching is allowed mid-task, not only at the end.",
+		minItems: 1,
+	})),
+	// Backward-compatible single-item shape. Required at runtime only when items[] is omitted.
+	type: Type.Optional(Type.String({ description: "fact, preference, decision, todo, constraint, instruction, entity_note, relationship, workflow_state" })),
+	subject: Type.Optional(Type.String({ description: "Short stable subject" })),
+	predicate: Type.Optional(Type.String({ description: "Relation or action" })),
+	object: Type.Optional(Type.String({ description: "Object value" })),
+	text: Type.Optional(Type.String({ description: "One sentence describing the memory" })),
+	scope: Type.Optional(Type.String({ description: "global, project, or session" })),
+	confidence: Type.Optional(Type.Number({ description: "0.0-1.0 (default 0.9)" })),
+	valid_from: Type.Optional(Type.String({ description: "ISO timestamp when the memory became valid" })),
+	valid_to: Type.Optional(Type.String({ description: "ISO timestamp when the memory expires" })),
+}, { description: "Use {items:[...]} for a batch, or provide single memory fields directly for one item." });
+
+function normalizeMemoryItems(params: any): { items: MemoryItem[]; error?: string } {
+	if (!params || typeof params !== "object") {
+		return { items: [], error: "memory_add expects either one memory object or { items: [...] }." };
+	}
+	const rawItems = Array.isArray(params.items) ? params.items : [params];
+	if (rawItems.length === 0) {
+		return { items: [], error: "memory_add batch requires at least one item." };
+	}
+	const items: MemoryItem[] = [];
+	for (const [index, item] of rawItems.entries()) {
+		if (!item || typeof item !== "object") {
+			return { items: [], error: `memory_add item #${index + 1} must be an object.` };
+		}
+		const missing = ["type", "subject", "predicate", "object", "text", "scope"].filter((key) => !item[key]);
+		if (missing.length) {
+			return { items: [], error: `memory_add item #${index + 1} missing required field(s): ${missing.join(", ")}.` };
+		}
+		items.push({
+			type: item.type,
+			subject: item.subject,
+			predicate: item.predicate,
+			object: item.object,
+			text: item.text,
+			scope: item.scope,
+			confidence: item.confidence ?? 0.9,
+			valid_from: item.valid_from,
+			valid_to: item.valid_to,
+		});
+	}
+	return { items };
+}
+
 function execCli(args: string[], stdin?: string): Promise<CliResult> {
 	const s = getSettings();
 	return new Promise((resolve) => {
@@ -225,6 +298,9 @@ export default function (pi: ExtensionAPI) {
 			"Use memory_search to retrieve context. Prefer it over raw DB access.",
 			"Use memory_walk to explore connected entities.",
 			"Use memory_add to store durable facts; it upserts by subject/predicate/object.",
+			"Batch memory writes: when two or more durable items are known now, call memory_add once with {items:[...]}.",
+			"Batching is allowed mid-task or after a worker wave; do not wait until the final response if earlier persistence is useful.",
+			"Avoid repeated back-to-back single memory_add calls; keep facts atomic as separate records inside the batch.",
 			"Use memory_force_add only when an intentional duplicate record is needed.",
 		].join(" "));
 		const systemPrompt = event.systemPrompt
@@ -233,83 +309,72 @@ export default function (pi: ExtensionAPI) {
 		return { systemPrompt };
 	});
 
+	const addMemoryItems = async (items: MemoryItem[], force = false): Promise<CliResult> => {
+		const args: string[] = ["memory", "add", "--project-id", projectId, "--session-id", sessionId];
+		if (force) args.push("--force");
+		return execCli(args, JSON.stringify(items));
+	};
+
+	let consecutiveSingleMemoryAdds = 0;
+	let lastSingleMemoryAddAt = 0;
+	const singleMemoryAddWindowMs = 2 * 60 * 1000;
+	const getSingleWriteGuardMessage = (itemCount: number): string | null => {
+		const now = Date.now();
+		if (itemCount > 1) {
+			consecutiveSingleMemoryAdds = 0;
+			lastSingleMemoryAddAt = 0;
+			return null;
+		}
+		consecutiveSingleMemoryAdds = lastSingleMemoryAddAt && now - lastSingleMemoryAddAt <= singleMemoryAddWindowMs
+			? consecutiveSingleMemoryAdds + 1
+			: 1;
+		lastSingleMemoryAddAt = now;
+		if (consecutiveSingleMemoryAdds < 2) return null;
+		return [
+			`⚠️ Batch guard: this was single memory_add #${consecutiveSingleMemoryAdds} in a row.`,
+			"If more related memories are available, stop issuing single calls and call memory_add once with {\"items\":[...]}.",
+			"Batching is allowed mid-task and after worker waves; facts should stay atomic as separate objects inside items[].",
+		].join(" ");
+	};
+
 	// ── Write tool ───────────────────────────────────────────────
 	pi.registerTool({
 		name: "memory_add",
-		label: "Add a fact to ppmlx memory",
-		description: "Store or update a durable fact in the memory graph. Upserts by subject/predicate/object.",
-		promptSnippet: "When you discover a durable fact, call memory_add to store it immediately.",
+		label: "Add facts to ppmlx memory",
+		description: "Store or update one or more durable facts in the memory graph. Upserts by subject/predicate/object. Prefer {items:[...]} for two or more facts.",
+		promptSnippet: "When durable facts emerge, call memory_add. If 2+ facts are known now, batch them with {items:[...]} in one call; batching can happen mid-task, not only at the end.",
 		promptGuidelines: [
 			"When user says \"zapamiętaj\", \"remember that\", \"zapisz\", or explicitly asks to store something — call memory_add.",
-			"When you make an architectural decision — proactively call memory_add with type=decision.",
-			"When user states a preference — call memory_add with type=preference.",
+			"When you make architectural decisions or learn preferences/constraints — proactively call memory_add.",
+			"Do not emit repeated back-to-back single memory_add calls. If you have multiple facts, use one batch call with items[].",
+			"Example batch: {\"items\":[{\"type\":\"preference\",\"subject\":\"agents memory writes\",\"predicate\":\"should_batch\",\"object\":\"related_facts\",\"text\":\"Agents should batch related durable facts in one memory_add call.\",\"scope\":\"global\",\"confidence\":0.95},{\"type\":\"decision\",\"subject\":\"memory_add\",\"predicate\":\"supports\",\"object\":\"items_batch\",\"text\":\"memory_add supports batching via an items array.\",\"scope\":\"project\",\"confidence\":0.95}]}",
 		],
-		parameters: Type.Object({
-			type: Type.String({ description: "fact, preference, decision, todo, constraint, instruction, entity_note, relationship, workflow_state" }),
-			subject: Type.String({ description: "Short stable subject" }),
-			predicate: Type.String({ description: "Relation or action" }),
-			object: Type.String({ description: "Object value" }),
-			text: Type.String({ description: "One sentence describing the memory" }),
-			scope: Type.String({ description: "global, project, or session" }),
-			confidence: Type.Optional(Type.Number({ description: "0.0-1.0 (default 0.9)" })),
-			valid_from: Type.Optional(Type.String({ description: "ISO timestamp when the memory became valid" })),
-			valid_to: Type.Optional(Type.String({ description: "ISO timestamp when the memory expires" })),
-		}),
+		parameters: MemoryAddParametersSchema,
 		execute: async (_id, params, _signal) => {
-			const args: string[] = ["memory", "add",
-				"--type", params.type,
-				"--subject", params.subject,
-				"--predicate", params.predicate,
-				"--object", params.object,
-				"--text", params.text,
-				"--scope", params.scope,
-				"--confidence", String(params.confidence ?? 0.9),
-				"--project-id", projectId,
-				"--session-id", sessionId,
-			];
-			if (params.valid_from) args.push("--valid-from", params.valid_from);
-			if (params.valid_to) args.push("--valid-to", params.valid_to);
-			const r = await execCli(args);
-			return { content: [{ type: "text", text: r.ok ? r.stdout : r.stderr }] };
+			const normalized = normalizeMemoryItems(params);
+			if (normalized.error) return { content: [{ type: "text", text: normalized.error }] };
+			const r = await addMemoryItems(normalized.items);
+			const text = r.ok ? r.stdout : r.stderr;
+			const guardMessage = r.ok ? getSingleWriteGuardMessage(normalized.items.length) : null;
+			return { content: [{ type: "text", text: guardMessage ? `${text.trim()}\n\n${guardMessage}` : text }] };
 		},
 	});
 
 	pi.registerTool({
 		name: "memory_force_add",
-		label: "Force-add a fact (bypass dedup)",
-		description: "Store a durable fact as a new record, bypassing subject/predicate/object deduplication.",
+		label: "Force-add facts (bypass dedup)",
+		description: "Store one or more durable facts as new records, bypassing subject/predicate/object deduplication.",
 		promptSnippet: "Use memory_force_add only when an intentional duplicate memory record is needed.",
 		promptGuidelines: [
 			"Prefer memory_add for normal durable facts.",
 			"Use memory_force_add only when the duplicate itself is meaningful or needed for debugging.",
+			"If force-adding multiple intentional duplicates, use {items:[...]} rather than repeated single calls.",
 		],
-		parameters: Type.Object({
-			type: Type.String({ description: "fact, preference, decision, todo, constraint, instruction, entity_note, relationship, workflow_state" }),
-			subject: Type.String({ description: "Short stable subject" }),
-			predicate: Type.String({ description: "Relation or action" }),
-			object: Type.String({ description: "Object value" }),
-			text: Type.String({ description: "One sentence describing the memory" }),
-			scope: Type.String({ description: "global, project, or session" }),
-			confidence: Type.Optional(Type.Number({ description: "0.0-1.0 (default 0.9)" })),
-			valid_from: Type.Optional(Type.String({ description: "ISO timestamp when the memory became valid" })),
-			valid_to: Type.Optional(Type.String({ description: "ISO timestamp when the memory expires" })),
-		}),
+		parameters: MemoryAddParametersSchema,
 		execute: async (_id, params, _signal) => {
-			const args: string[] = ["memory", "add",
-				"--force",
-				"--type", params.type,
-				"--subject", params.subject,
-				"--predicate", params.predicate,
-				"--object", params.object,
-				"--text", params.text,
-				"--scope", params.scope,
-				"--confidence", String(params.confidence ?? 0.9),
-				"--project-id", projectId,
-				"--session-id", sessionId,
-			];
-			if (params.valid_from) args.push("--valid-from", params.valid_from);
-			if (params.valid_to) args.push("--valid-to", params.valid_to);
-			const r = await execCli(args);
+			const normalized = normalizeMemoryItems(params);
+			if (normalized.error) return { content: [{ type: "text", text: normalized.error }] };
+			const r = await addMemoryItems(normalized.items, true);
 			return { content: [{ type: "text", text: r.ok ? r.stdout : r.stderr }] };
 		},
 	});

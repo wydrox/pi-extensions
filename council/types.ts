@@ -78,6 +78,8 @@ export interface CouncilParams {
   evidence: string[];
   /** Working directory */
   cwd: string;
+  /** Override model for all experts (from active session) */
+  sessionModel?: string;
 }
 
 export type CouncilCriterion =

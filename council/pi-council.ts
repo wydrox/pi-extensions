@@ -237,7 +237,10 @@ export async function spawnPi(opts: SpawnOptions): Promise<SpawnResult> {
         if (!text) return false;
         lastAssistantText = text;
         lastAssistantJson = extractJsonFromText(text);
-        return true;
+        // Do not terminate on pre-tool or explanatory text. Council phases require
+        // JSON; keep the subprocess alive until a parsable JSON response appears
+        // or the child exits naturally.
+        return lastAssistantJson !== null;
       };
 
       const processLine = (line: string) => {
@@ -337,6 +340,10 @@ export interface RunExpertCardOptions {
   evidence?: string[];
   /** Working directory */
   cwd?: string;
+  /** Model override */
+  model?: string;
+  /** Thinking level */
+  thinking?: string;
   /** Expert index for tracking */
   index: number;
   /** Expert name for logging */
@@ -382,6 +389,8 @@ Output ONLY the JSON object, no other text.`;
     tools: opts.tools,
     appendSystem: true,
     cwd: opts.cwd,
+    model: opts.model,
+    thinking: opts.thinking,
     label: `expert-card-${opts.name}`,
     systemPrompt: opts.rolePrompt,
   });
@@ -396,6 +405,10 @@ export interface RunExpertRankingOptions {
   cards: Record<string, Array<{ id: string; claim: string; why: string; if_ignored: string; confidence: string; basis: string }>>;
   /** Ranking criteria */
   criteria: string[];
+  /** Model override */
+  model?: string;
+  /** Thinking level */
+  thinking?: string;
   /** Expert index for tracking */
   index: number;
   /** Expert name for logging */
@@ -453,6 +466,8 @@ Output ONLY the JSON object.`;
     task,
     tools: ["read", "grep"],
     appendSystem: true,
+    model: opts.model,
+    thinking: opts.thinking,
     label: `expert-rank-${opts.name}`,
   });
 }
@@ -464,6 +479,10 @@ export interface RunSynthesisOptions {
   prompt: string;
   /** Top cards, rankings, and conflicts to synthesize from */
   context: string;
+  /** Model override */
+  model?: string;
+  /** Thinking level */
+  thinking?: string;
 }
 
 /**
@@ -478,6 +497,8 @@ export async function runSynthesis(
     task,
     tools: ["read"],
     appendSystem: true,
+    model: opts.model,
+    thinking: opts.thinking,
     label: "synthesizer",
     systemPrompt: opts.prompt,
   });
@@ -490,6 +511,10 @@ export interface RunModeratorOptions {
   evidence?: string[];
   cwd?: string;
   expertSummary?: string;
+  /** Model override */
+  model?: string;
+  /** Thinking level */
+  thinking?: string;
 }
 
 /**
@@ -526,6 +551,8 @@ Output ONLY the JSON object.`;
     tools: ["read", "grep", "find"],
     appendSystem: true,
     cwd: opts.cwd,
+    model: opts.model,
+    thinking: opts.thinking,
     label: "moderator",
   });
 }

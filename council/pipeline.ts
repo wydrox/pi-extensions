@@ -121,6 +121,12 @@ function parseAtFiles(rawArgs: string): string[] {
   });
 }
 
+function formatSpawnFailure(result: SpawnResult): string {
+  if (result.error) return result.error;
+  const preview = result.text.trim().replace(/\s+/g, " ").slice(0, 200);
+  return preview ? `invalid JSON output: ${preview}` : "no output";
+}
+
 /** Max file size for evidence (bytes) */
 const MAX_EVIDENCE_SIZE = 100_000;
 
@@ -194,8 +200,12 @@ function gatherDefaultEvidence(cwd: string): string[] {
 
 // ── Params ───────────────────────────────────────────────────────────
 
-function parseParams(rawArgs: string): CouncilParams {
+function parseParams(rawArgs: string, sessionModel?: string): CouncilParams {
   const experts = discoverCouncilAgents();
+  // Always override expert model with session model when provided
+  if (sessionModel) {
+    experts.forEach((e) => { e.model = sessionModel; });
+  }
   experts.forEach((e, i) => (e.index = i));
 
   const atFiles = parseAtFiles(rawArgs);
@@ -221,6 +231,7 @@ function parseParams(rawArgs: string): CouncilParams {
     experts,
     evidence: allEvidence,
     cwd: process.cwd(),
+    sessionModel,
   };
 }
 
@@ -250,12 +261,14 @@ async function generateCards(
         question: enrichedQuestion,
         evidence: params.evidence,
         cwd: params.cwd,
+        model: expert.model,
+        thinking: expert.thinking,
         index: expert.index!,
         name: expert.name,
       });
       if (!result.ok || !result.json) {
         const tag = isRetry ? " (retry)" : "";
-        errors.push(`${expert.name}: ${result.error || "no output"}${tag}`);
+        errors.push(`${expert.name}: ${formatSpawnFailure(result)}${tag}`);
         return null;
       }
       const output = result.json as ExpertCardOutput;
@@ -358,12 +371,14 @@ async function rankCards(
         rolePrompt: expert.perspective,
         cards: byCategory,
         criteria: params.criteria,
+        model: expert.model,
+        thinking: expert.thinking,
         index: expert.index!,
         name: expert.name,
       });
       if (!result.ok || !result.json) {
         errors.push(
-          `${expert.name} ranking: ${result.error || "no output"}`,
+          `${expert.name} ranking: ${formatSpawnFailure(result)}`,
         );
         return [];
       }
@@ -400,6 +415,7 @@ async function synthesize(
   question: string,
   coverage: ReturnType<typeof applyCoverageRules>,
   groupthinkDetected: boolean,
+  sessionModel?: string,
 ): Promise<{
   recommendation: string;
   agreements: string[];
@@ -458,11 +474,13 @@ async function synthesize(
   const result = await runSynthesis({
     prompt: synthPrompt || "Synthesize the council results.",
     context: contextParts.join("\n"),
+    model: sessionModel,
+    thinking: "high",
   });
 
   if (!result.ok || !result.json) {
     return {
-      recommendation: `Synthesis failed: ${result.error || "no output"}`,
+      recommendation: `Synthesis failed: ${formatSpawnFailure(result)}`,
       agreements: [],
       clashes: [],
       blindSpots: ["Synthesizer failed to produce output"],
@@ -490,6 +508,7 @@ export type PhaseCallback = (update: PhaseUpdate) => void;
 export async function runCouncil(
   rawArgs: string,
   onPhase?: PhaseCallback,
+  sessionModel?: string,
 ): Promise<CouncilResult> {
   const emit = (update: PhaseUpdate) => onPhase?.(update);
   const startTime = Date.now();
@@ -502,7 +521,7 @@ export async function runCouncil(
     durationMs: 0,
   };
 
-  const params = parseParams(rawArgs);
+  const params = parseParams(rawArgs, sessionModel);
   meta.mode = params.depth;
   meta.expertsUsed = params.experts.map((e) => e.name);
   const n = params.experts.length;
@@ -530,6 +549,8 @@ export async function runCouncil(
       evidence: params.evidence,
       cwd: params.cwd,
       expertSummary: `${n} experts: ${params.experts.map((e) => e.role).join(", ")}`,
+      model: params.sessionModel,
+      thinking: "low",
     });
 
     if (modResult.ok && modResult.json) {
@@ -540,7 +561,7 @@ export async function runCouncil(
         detail: moderatorBrief.brief?.slice(0, 200),
       });
     } else {
-      meta.phaseErrors.push(`Moderator: ${modResult.error || "no output"}`);
+      meta.phaseErrors.push(`Moderator: ${formatSpawnFailure(modResult)}`);
     }
   }
 
@@ -575,9 +596,9 @@ export async function runCouncil(
 
   emit({ phase: "permute", message: params.blind ? `Permuting ${rawCards.length} cards (full blind)…` : `Grouping ${rawCards.length} cards…` });
 
-  const { permuted, reverseMapping } = params.blind
+  const { permuted, mapping } = params.blind
     ? permuteCards(rawCards)
-    : { permuted: rawCards, reverseMapping: new Map<string, string>(), mapping: new Map<string, string>() };
+    : { permuted: rawCards, mapping: new Map<string, string>(), reverseMapping: new Map<string, string>() };
 
   emit({ phase: "ranking", message: `Ranking (${n} experts)…`, progress: { current: 0, total: n } });
 
@@ -587,7 +608,7 @@ export async function runCouncil(
   emit({ phase: "ranking", message: `Rankings collected`, progress: { current: n, total: n } });
 
   const { rankings, cards: restoredCards } = params.blind
-    ? restoreCardIds(permutedRankings, reverseMapping, rawCards)
+    ? restoreCardIds(permutedRankings, mapping, rawCards)
     : { rankings: permutedRankings, cards: rawCards };
 
   // ── Phase 3: Aggregate ──────────────────────────────────────────
@@ -602,7 +623,7 @@ export async function runCouncil(
 
   emit({ phase: "synthesize", message: groupthinkDetected ? "Synthesizing (⚠ groupthink)…" : "Synthesizing…" });
 
-  const synthesis = await synthesize(params.question, coverage, groupthinkDetected);
+  const synthesis = await synthesize(params.question, coverage, groupthinkDetected, params.sessionModel);
 
   meta.durationMs = Date.now() - startTime;
 

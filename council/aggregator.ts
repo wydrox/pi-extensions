@@ -213,23 +213,15 @@ export function permuteCards(cards: Card[]): {
  */
 export function restoreCardIds(
   rankings: RankingEntry[],
-  reverseMapping: Map<string, string>,
+  mapping: Map<string, string>,
   cards: Card[],
 ): { rankings: RankingEntry[]; cards: Card[] } {
-  const cardMap = new Map(cards.map((c) => [c.id, c]));
-
   const restoredRankings = rankings.map((r) => ({
     ...r,
-    cardId: reverseMapping.get(r.cardId) || r.cardId,
+    cardId: mapping.get(r.cardId) || r.cardId,
   }));
 
-  // Restore card IDs for the cards that were ranked
-  const restoredCards = cards.map((c) => {
-    const origId = reverseMapping.get(c.id);
-    return origId ? { ...c, id: origId } : c;
-  });
-
-  return { rankings: restoredRankings, cards: restoredCards };
+  return { rankings: restoredRankings, cards };
 }
 
 // ── Consensus Check ──────────────────────────────────────────────────
